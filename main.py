@@ -2,6 +2,7 @@ import asyncio
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.star import star_map
 
@@ -19,7 +20,7 @@ def player_key(event: AstrMessageEvent) -> tuple[str, str]:
 
 
 class AdventureSession:
-    def __init__(self, provider, history: list[dict[str, str]]):
+    def __init__(self, provider: Provider, history: list[dict[str, str]]):
         self.provider = provider
         self.history = history
         self.ready = False
@@ -234,12 +235,22 @@ class TextAdventurePlugin(Star):
             ).stop_event()
             return
 
-        llm_provider = self.context.get_using_provider()
-        if not llm_provider:
-            yield event.plain_result(
-                "当前没有可用的 LLM 服务来开始冒险，请联系管理员。"
-            ).stop_event()
-            return
+        provider_id = (self.config.get("llm_provider_id") or "").strip()
+        if provider_id:
+            llm_provider = self.context.get_provider_by_id(provider_id)
+            if not isinstance(llm_provider, Provider):
+                yield event.plain_result(
+                    "所选的冒险模型不可用。请在插件配置中重新选择已启用的聊天模型，"
+                    "或清空此项以使用 AstrBot 默认聊天模型。"
+                ).stop_event()
+                return
+        else:
+            llm_provider = self.context.get_using_provider()
+            if llm_provider is None:
+                yield event.plain_result(
+                    "当前没有可用的 LLM 服务来开始冒险，请联系管理员。"
+                ).stop_event()
+                return
 
         game_theme = theme.strip() or self.default_adventure_theme
         try:
