@@ -7,9 +7,12 @@ from tempfile import NamedTemporaryFile
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image
 from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.star import star_map
+
+from .story_card import render_story_cards
 
 
 INPUT_MATCH = "textadventure_input"
@@ -197,6 +200,7 @@ class TextAdventurePlugin(Star):
         self.session_timeout = max(0, self.config.get("session_timeout", 300))
         self.trigger_prefix = self.config.get("trigger_prefix", "/").strip() or "/"
         self.require_action_prefix = self.config.get("require_action_prefix", False)
+        self.story_output_mode = self.config.get("story_output_mode", "跟随 AstrBot")
         self.system_prompt_template = self.config.get(
             "system_prompt_template",
             "你是一位经验丰富的文字冒险游戏主持人(Game Master)。你将在一个'{game_theme}'主题下，根据玩家的行动实时生成独特且逻辑连贯的故事情节。"
@@ -324,13 +328,42 @@ class TextAdventurePlugin(Star):
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": story},
         ])
-        return self.story_result(event, session, story)
+        return await self.story_result(event, session, story)
 
-    def story_result(self, event: AstrMessageEvent, session: AdventureSession, story: str):
-        event.set_extra(STORY_SESSION, session)
-        return event.plain_result(
-            f"{story}\n\n[行动示例：{self.action_example}] (玩家ID: {event.get_sender_id()})"
+    async def story_result(
+        self, event: AstrMessageEvent, session: AdventureSession, story: str, saved_name: str = "",
+    ):
+        if session.closed:
+            return
+        player_id = event.get_sender_id()
+        prefix = f"📖 已读取冒险存档「{saved_name}」\n\n" if saved_name else ""
+        text_result = event.plain_result(
+            f"{prefix}{story}\n\n[行动示例：{self.action_example}] (玩家ID: {player_id})"
         )
+        mode = self.story_output_mode
+        if mode == "图片":
+            try:
+                pages = await asyncio.to_thread(
+                    render_story_cards, story, self.action_example, player_id,
+                    (len(session.history) - 1) // 2, saved_name,
+                )
+                result = event.chain_result([Image.fromBytes(page) for page in pages])
+            except Exception:
+                logger.exception("渲染冒险日志图片失败，改用文字发送")
+            else:
+                if not session.closed:
+                    event.set_extra(STORY_SESSION, session)
+                    return result
+                return
+
+        if session.closed:
+            return
+        if mode in {"文字", "图片"}:
+            await event.send(text_result)
+            return
+
+        event.set_extra(STORY_SESSION, session)
+        return text_result
 
     async def play_turn(self, event: AstrMessageEvent, action: str, session: AdventureSession):
         async with session.turn_lock:
@@ -434,7 +467,7 @@ class TextAdventurePlugin(Star):
                 logger.exception("开始文字冒险失败")
                 yield event.plain_result("无法开始冒险，请稍后重试。").stop_event()
         finally:
-            if story is not None and not session.closed:
+            if len(session.history) > 1 and not session.closed:
                 session.ready = True
                 self.arm_timeout(event, session)
             event.stop_event()
@@ -502,10 +535,13 @@ class TextAdventurePlugin(Star):
 
             async def read_save():
                 async with self.save_lock:
-                    return await asyncio.to_thread(read_adventure_save, key, name)
+                    saved_name, history = await asyncio.to_thread(read_adventure_save, key, name)
+                if not session.closed:
+                    session.history = history
+                    return await self.story_result(event, session, history[-1]["content"], saved_name)
 
             try:
-                saved_game = await session.run(read_save())
+                result = await session.run(read_save())
             except FileNotFoundError:
                 if self.remove_session(key, session):
                     if name:
@@ -520,10 +556,8 @@ class TextAdventurePlugin(Star):
                     yield event.plain_result("无法读取冒险存档，请联系管理员检查存档文件。")
                 return
 
-            if saved_game is not None and not session.closed:
-                saved_name, session.history = saved_game
-                story = session.history[-1]["content"]
-                yield self.story_result(event, session, f"📖 已读取冒险存档「{saved_name}」\n\n{story}")
+            if result is not None and not session.closed:
+                yield result
         finally:
             if session is not None and not session.closed:
                 if session.history:
