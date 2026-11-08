@@ -8,6 +8,7 @@ from astrbot.core.star.star import star_map
 
 
 INPUT_MATCH = "textadventure_input"
+STORY_SESSION = "textadventure_story_session"
 START = "开始冒险"
 END = "结束冒险"
 FORCE_END = "强制结束冒险"
@@ -59,11 +60,11 @@ class AdventureInputFilter(filter.CustomFilter):
         return metadata.star_cls.match_input(event)
 
 
-@register("textadventure", "YourName", "一个将故事文字渲染为图片的动态冒险小游戏", "1.4.1")
+@register("textadventure", "YourName", "一个由 LLM 驱动的动态文字冒险小游戏", "1.4.1")
 class TextAdventurePlugin(Star):
     """
     一个由LLM驱动的图文动态文字冒险游戏插件。
-    此版本将AI生成的故事文字直接渲染为图片进行展示，并包含健壮的会话管理。
+    剧情通过 AstrBot 的回复流程发送，可由输出插件按配置处理。
     核心参数（如超时时间、系统提示词）均可通过配置文件修改。
     """
 
@@ -142,7 +143,8 @@ class TextAdventurePlugin(Star):
         kind, text, session = event.get_extra(INPUT_MATCH)
         if kind == "action":
             if not event.get_extra("handlers_parsed_params"):
-                await self.play_turn(event, text, session)
+                async for result in self.play_turn(event, text, session):
+                    yield result
             return
 
         handler = {
@@ -180,7 +182,14 @@ class TextAdventurePlugin(Star):
         session.close()
         return True
 
-    async def send_story(self, event: AstrMessageEvent, session: AdventureSession, prompt: str):
+    @filter.on_decorating_result(priority=-1000)
+    async def discard_closed_story(self, event: AstrMessageEvent):
+        session = event.get_extra(STORY_SESSION)
+        if session is not None and session.closed:
+            event.clear_result()
+            event.stop_event()
+
+    async def make_story_result(self, event: AstrMessageEvent, session: AdventureSession, prompt: str):
         response = await session.provider.text_chat(
             prompt=prompt, session_id=event.get_session_id(), contexts=session.history,
         )
@@ -191,25 +200,27 @@ class TextAdventurePlugin(Star):
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": story},
         ])
-        await event.send(event.plain_result(
+        event.set_extra(STORY_SESSION, session)
+        return event.plain_result(
             f"{story}\n\n[行动示例：{self.action_example}] (玩家ID: {event.get_sender_id()})"
-        ))
+        )
 
     async def play_turn(self, event: AstrMessageEvent, action: str, session: AdventureSession):
         async with session.turn_lock:
             if session.closed:
                 return
             session.cancel_timer()
-            event.stop_event()
 
             async def respond():
                 await event.send(event.plain_result("AI正在构思下一幕...请稍等片刻..."))
                 if session.closed:
                     return
-                await self.send_story(event, session, action)
+                return await self.make_story_result(event, session, action)
 
             try:
-                await session.run(respond())
+                story = await session.run(respond())
+                if story is not None and not session.closed:
+                    yield story
             except asyncio.CancelledError:
                 self.remove_session(player_key(event), session)
                 raise
@@ -217,8 +228,9 @@ class TextAdventurePlugin(Star):
                 if self.remove_session(player_key(event), session):
                     logger.exception("推进文字冒险失败")
                     await event.send(event.plain_result("冒险过程中发生错误，游戏已结束。"))
-                return
-            self.arm_timeout(event, session)
+            finally:
+                self.arm_timeout(event, session)
+                event.stop_event()
 
     @filter.command(START)
     async def start_adventure(self, event: AstrMessageEvent):
@@ -278,10 +290,13 @@ class TextAdventurePlugin(Star):
                 "正在构筑你的冒险世界，请稍候……"
             ))
             if not session.closed:
-                await self.send_story(event, session, "故事开始了，我的第一个场景是什么？")
+                return await self.make_story_result(event, session, "故事开始了，我的第一个场景是什么？")
 
+        story = None
         try:
-            await session.run(open_adventure())
+            story = await session.run(open_adventure())
+            if story is not None and not session.closed:
+                yield story
         except asyncio.CancelledError:
             self.remove_session(key, session)
             raise
@@ -289,11 +304,10 @@ class TextAdventurePlugin(Star):
             if self.remove_session(key, session):
                 logger.exception("开始文字冒险失败")
                 yield event.plain_result("无法开始冒险，请稍后重试。").stop_event()
-        else:
-            if not session.closed:
+        finally:
+            if story is not None and not session.closed:
                 session.ready = True
                 self.arm_timeout(event, session)
-        finally:
             event.stop_event()
 
     @filter.command(END, alias={FORCE_END})
