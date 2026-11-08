@@ -1,9 +1,13 @@
 import asyncio
+import hashlib
+import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import Provider
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.star import star_map
 
 
@@ -12,12 +16,56 @@ STORY_SESSION = "textadventure_story_session"
 START = "开始冒险"
 END = "结束冒险"
 FORCE_END = "强制结束冒险"
+SAVE = "存档冒险"
+LOAD = "读取冒险"
 HELP = "冒险帮助"
 ADMIN_END = "admin end"
 
 
 def player_key(event: AstrMessageEvent) -> tuple[str, str]:
     return event.unified_msg_origin, event.get_sender_id()
+
+
+def adventure_save_path(key: tuple[str, str]) -> Path:
+    key_bytes = json.dumps(key, ensure_ascii=False).encode("utf-8")
+    filename = f"{hashlib.sha256(key_bytes).hexdigest()}.json"
+    return StarTools.get_data_dir("textadventure") / "saves" / filename
+
+
+def write_adventure_save(key: tuple[str, str], history: list[dict[str, str]]) -> None:
+    path = adventure_save_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False,
+    )
+    temp_path = Path(temp.name)
+    try:
+        with temp:
+            json.dump({"version": 1, "history": history}, temp, ensure_ascii=False)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_adventure_save(key: tuple[str, str]) -> list[dict[str, str]]:
+    with adventure_save_path(key).open(encoding="utf-8") as save_file:
+        data = json.load(save_file)
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("无法识别冒险存档格式")
+
+    history = data.get("history")
+    if not isinstance(history, list) or len(history) < 3 or len(history) % 2 == 0:
+        raise ValueError("存档缺少完整回合")
+
+    for index, message in enumerate(history):
+        role = "system" if index == 0 else ("user" if index % 2 else "assistant")
+        if (
+            not isinstance(message, dict)
+            or message.get("role") != role
+            or not isinstance(message.get("content"), str)
+        ):
+            raise ValueError("存档中的对话记录格式错误")
+    return history
 
 
 class AdventureSession:
@@ -95,6 +143,7 @@ class TextAdventurePlugin(Star):
         logger.info("------------------------------------")
 
         self.active_game_sessions: dict[tuple[str, str], AdventureSession] = {}
+        self.save_lock = asyncio.Lock()
 
     @property
     def action_example(self) -> str:
@@ -121,11 +170,11 @@ class TextAdventurePlugin(Star):
             if command == START:
                 event.set_extra(INPUT_MATCH, (START, args[0] if args else "", None))
                 return True
-            if action in {END, FORCE_END, HELP, ADMIN_END}:
+            if action in {END, FORCE_END, SAVE, LOAD, HELP, ADMIN_END}:
                 event.set_extra(INPUT_MATCH, (action, "", None))
                 return True
 
-        if command in {START, END, FORCE_END, HELP} or action == ADMIN_END:
+        if command in {START, END, FORCE_END, SAVE, LOAD, HELP} or action == ADMIN_END:
             return False
         if self.require_action_prefix and not has_prefix:
             return False
@@ -151,6 +200,8 @@ class TextAdventurePlugin(Star):
             START: self.start_game,
             END: self.end_adventure,
             FORCE_END: self.end_adventure,
+            SAVE: self.save_adventure,
+            LOAD: self.load_adventure,
             HELP: self.cmd_adventure_help,
             ADMIN_END: self.cmd_admin_end_all_games,
         }[kind]
@@ -200,6 +251,9 @@ class TextAdventurePlugin(Star):
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": story},
         ])
+        return self.story_result(event, session, story)
+
+    def story_result(self, event: AstrMessageEvent, session: AdventureSession, story: str):
         event.set_extra(STORY_SESSION, session)
         return event.plain_result(
             f"{story}\n\n[行动示例：{self.action_example}] (玩家ID: {event.get_sender_id()})"
@@ -240,6 +294,22 @@ class TextAdventurePlugin(Star):
         async for result in self.start_game(event, theme):
             yield result
 
+    def adventure_provider(self) -> tuple[Provider | None, str]:
+        provider_id = (self.config.get("llm_provider_id") or "").strip()
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if isinstance(provider, Provider):
+                return provider, ""
+            return None, (
+                "所选的冒险模型不可用。请在插件配置中重新选择已启用的聊天模型，"
+                "或清空此项以使用 AstrBot 默认聊天模型。"
+            )
+
+        provider = self.context.get_using_provider()
+        if provider is None:
+            return None, "当前没有可用的 LLM 服务，请联系管理员。"
+        return provider, ""
+
     async def start_game(self, event: AstrMessageEvent, theme: str):
         key = player_key(event)
         if key in self.active_game_sessions:
@@ -249,22 +319,10 @@ class TextAdventurePlugin(Star):
             ).stop_event()
             return
 
-        provider_id = (self.config.get("llm_provider_id") or "").strip()
-        if provider_id:
-            llm_provider = self.context.get_provider_by_id(provider_id)
-            if not isinstance(llm_provider, Provider):
-                yield event.plain_result(
-                    "所选的冒险模型不可用。请在插件配置中重新选择已启用的聊天模型，"
-                    "或清空此项以使用 AstrBot 默认聊天模型。"
-                ).stop_event()
-                return
-        else:
-            llm_provider = self.context.get_using_provider()
-            if llm_provider is None:
-                yield event.plain_result(
-                    "当前没有可用的 LLM 服务来开始冒险，请联系管理员。"
-                ).stop_event()
-                return
+        llm_provider, error = self.adventure_provider()
+        if llm_provider is None:
+            yield event.plain_result(error).stop_event()
+            return
 
         game_theme = theme.strip() or self.default_adventure_theme
         try:
@@ -308,6 +366,77 @@ class TextAdventurePlugin(Star):
             if story is not None and not session.closed:
                 session.ready = True
                 self.arm_timeout(event, session)
+            event.stop_event()
+
+    @filter.command(SAVE)
+    async def save_adventure(self, event: AstrMessageEvent):
+        """保存当前冒险最近一次生成完毕的回合。"""
+        key = player_key(event)
+        try:
+            async with self.save_lock:
+                session = self.active_game_sessions.get(key)
+                if session is None or not session.ready:
+                    message = "当前没有可以存档的冒险，请在开场剧情生成后再存档。"
+                else:
+                    try:
+                        await asyncio.to_thread(write_adventure_save, key, session.history.copy())
+                        message = (
+                            "💾 已存档到最近完成的回合。"
+                            f"结束后可发送 {self.trigger_prefix}{LOAD} 继续。"
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        logger.exception("写入文字冒险存档失败")
+                        message = "存档失败，请联系管理员检查插件数据目录。"
+            yield event.plain_result(message)
+        finally:
+            event.stop_event()
+
+    @filter.command(LOAD)
+    async def load_adventure(self, event: AstrMessageEvent):
+        """读取当前玩家在此聊天中的冒险存档。"""
+        key = player_key(event)
+        session = None
+        try:
+            if key in self.active_game_sessions:
+                yield event.plain_result(
+                    f"你已有正在进行的冒险，请先发送 {self.trigger_prefix}{END} 再读档。"
+                )
+                return
+
+            llm_provider, error = self.adventure_provider()
+            if llm_provider is None:
+                yield event.plain_result(error)
+                return
+
+            session = AdventureSession(llm_provider, [])
+            self.active_game_sessions[key] = session
+
+            async def read_save():
+                async with self.save_lock:
+                    return await asyncio.to_thread(read_adventure_save, key)
+
+            try:
+                history = await session.run(read_save())
+            except FileNotFoundError:
+                if self.remove_session(key, session):
+                    yield event.plain_result("当前聊天中还没有你的冒险存档。")
+                return
+            except (OSError, RuntimeError, ValueError):
+                if self.remove_session(key, session):
+                    logger.exception("读取文字冒险存档失败")
+                    yield event.plain_result("无法读取冒险存档，请联系管理员检查存档文件。")
+                return
+
+            if history is not None and not session.closed:
+                session.history = history
+                yield self.story_result(event, session, f"📖 已读取冒险存档\n\n{history[-1]['content']}")
+        finally:
+            if session is not None and not session.closed:
+                if session.history:
+                    session.ready = True
+                    self.arm_timeout(event, session)
+                else:
+                    self.remove_session(key, session)
             event.stop_event()
 
     @filter.command(END, alias={FORCE_END})
@@ -354,6 +483,7 @@ class TextAdventurePlugin(Star):
             "📜 动态文字冒险帮助手册\n\n"
             f"- `{prefix}{START} [可选主题]` 开始一场新冒险。\n"
             f"- 冒险中发送「{self.action_example}」推进剧情。{self.timeout_hint}\n"
+            f"- `{prefix}{SAVE}` 保存当前进度，`{prefix}{LOAD}` 读取此聊天里的存档。\n"
             f"- `{prefix}{END}` 或 `{prefix}{FORCE_END}` 立即结束当前冒险。\n"
             f"- `{prefix}{ADMIN_END}` 由管理员结束所有冒险。"
         ).stop_event()
