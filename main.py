@@ -180,14 +180,17 @@ class TextAdventurePlugin(Star):
         session.close()
         return True
 
-    async def send_story(self, event: AstrMessageEvent, session: AdventureSession):
+    async def send_story(self, event: AstrMessageEvent, session: AdventureSession, prompt: str):
         response = await session.provider.text_chat(
-            prompt="", session_id=event.get_session_id(), contexts=session.history,
+            prompt=prompt, session_id=event.get_session_id(), contexts=session.history,
         )
         if session.closed:
             return
         story = response.completion_text
-        session.history.append({"role": "assistant", "content": story})
+        session.history.extend([
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": story},
+        ])
         await event.send(event.plain_result(
             f"{story}\n\n[行动示例：{self.action_example}] (玩家ID: {event.get_sender_id()})"
         ))
@@ -203,8 +206,7 @@ class TextAdventurePlugin(Star):
                 await event.send(event.plain_result("AI正在构思下一幕...请稍等片刻..."))
                 if session.closed:
                     return
-                session.history.append({"role": "user", "content": action})
-                await self.send_story(event, session)
+                await self.send_story(event, session, action)
 
             try:
                 await session.run(respond())
@@ -264,7 +266,6 @@ class TextAdventurePlugin(Star):
 
         session = AdventureSession(llm_provider, [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "故事开始了，我的第一个场景是什么？"},
         ])
         self.active_game_sessions[key] = session
 
@@ -277,7 +278,7 @@ class TextAdventurePlugin(Star):
                 "正在构筑你的冒险世界，请稍候……"
             ))
             if not session.closed:
-                await self.send_story(event, session)
+                await self.send_story(event, session, "故事开始了，我的第一个场景是什么？")
 
         try:
             await session.run(open_adventure())
